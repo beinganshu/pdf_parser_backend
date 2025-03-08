@@ -31,7 +31,7 @@ def clean_and_chunk_text(text_list, chunk_size=500):
     words = full_text.split()
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
-def index_text_chunks(text_chunks, model_name='sentence-transformers/all-MiniLM-L6-v2'):
+def index_text_chunks(text_chunks, model_name='paraphrase-MiniLM-L3-v2'):
     model = SentenceTransformer(model_name)
     embeddings = np.array(model.encode(text_chunks))
     dimension = embeddings.shape[1]
