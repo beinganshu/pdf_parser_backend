@@ -1,88 +1,86 @@
+from fastapi import FastAPI, UploadFile, File, Form
+import shutil
 import os
-import pickle
-import pytesseract
-from pdf2image import convert_from_path
-import re
-import pdfplumber
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
-import google.generativeai as genai
+from model_handler import extract_text_from_pdf, clean_and_chunk_text, index_text_chunks, query_gemini_ai, save_model, load_model
+import os
+import shutil
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-MODEL_DIR = "models"
-MODEL_FILE = os.path.join(MODEL_DIR, "CV_SDE.pdf.pkl")
+app = FastAPI()
 
-def extract_text_from_pdf(pdf_path, use_ocr=False, ocr_lang='eng'):
-    extracted_text = []
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+active_sessions = {}
+@app.get("/")
+def home():
+    return {"message":"Hello World!"}
+@app.post("/upload/")
+def upload_pdf(file: UploadFile = File(...)):
+    try:
+        # Save file
+        file_path = f"uploads/{file.filename}"
+        os.makedirs("uploads", exist_ok=True)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Extract text and index the PDF
+        raw_text = extract_text_from_pdf(file_path, use_ocr=True)
+        text_chunks = clean_and_chunk_text(raw_text)
+        index, embeddings, model, text_chunks = index_text_chunks(text_chunks)
+
+        # Save the model
+        model_file_path = f"models/{file.filename}.pkl"
+        save_model(model_file_path, index, model, text_chunks)
+
+        # Add to active sessions
+        active_sessions[file.filename] = {
+            "uploaded": True,
+            "model_file_path": model_file_path
+        }
+
+        return JSONResponse(content={"upload-message": "File uploaded and indexed successfully"})
+
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)})
+
+
+@app.post("/query/")
+def query_pdf(query: str = Form(...)):
+    # Check if there's an active session
+    active_file = None
+    for filename, session in active_sessions.items():
+        if session.get("uploaded"):
+            active_file = filename
+            break
     
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if not text and use_ocr:
-                try:
-                    images = convert_from_path(pdf_path, first_page=page.page_number, last_page=page.page_number, dpi=100)
-                    for img in images:
-                        text = pytesseract.image_to_string(img, lang=ocr_lang)
-                except Exception as e:
-                    print(f"Error processing page {page.page_number}: {e}")
-            extracted_text.append(text.strip() if text else '')
+    if not active_file:
+        return JSONResponse(content={"error": "No file uploaded or session has ended"})
     
-    return extracted_text
-
-def clean_and_chunk_text(text_list, chunk_size=500):
-    full_text = "\n".join(text_list)
-    full_text = re.sub(r'\s+', ' ', full_text)
-    words = full_text.split()
-    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
-
-def index_text_chunks(text_chunks, model_name='sentence-transformers/all-MiniLM-L6-v2'):
-    model = SentenceTransformer(model_name)
-    embeddings = np.array(model.encode(text_chunks))
-    dimension = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embeddings)
-    return index, embeddings, model, text_chunks
-
-def create_and_save_model():
-    """Creates a dummy FAISS index and saves it if the model file is missing."""
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    # Handle the "quit" query to stop the session
+    if query.lower() == "quit":
+        model_file_path = active_sessions[active_file]["model_file_path"]
+        
+        # Delete the model after quitting the session
+        if os.path.exists(model_file_path):
+            os.remove(model_file_path)
+        
+        # Remove the session from active_sessions
+        active_sessions[active_file]["uploaded"] = False
+        
+        return JSONResponse(content={"message": "Query session ended and model deleted."})
     
-    # Sample text chunks for indexing
-    text_chunks = ["This is a sample text chunk for indexing."]
+    # Process the query with the current active file
+    try:
+        model_file_path = active_sessions[active_file]["model_file_path"]
+        index, model, text_chunks = load_model(model_file_path)
+        response = query_gemini_ai(query, index, model, text_chunks)
+        return JSONResponse(content={"response": response})
     
-    # Load Sentence Transformer model
-    model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-    
-    # Create embeddings
-    embeddings = np.array(model.encode(text_chunks))
-    dimension = embeddings.shape[1]
-    
-    # Create FAISS index
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embeddings)
-
-    # Save the model
-    with open(MODEL_FILE, "wb") as f:
-        pickle.dump((index, model, text_chunks), f)
-
-    print(f"✅ Model saved at {MODEL_FILE}")
-
-# Ensure the model is available when the app starts
-if not os.path.exists(MODEL_FILE):
-    print("⚠️ Model not found! Creating a new one...")
-    create_and_save_model()
-
-def load_model():
-    with open(MODEL_FILE, "rb") as f:
-        return pickle.load(f)
-
-def query_gemini_ai(query, index, model, text_chunks, top_k=5):
-    query_embedding = np.array([model.encode(query)])
-    distances, indices = index.search(query_embedding, top_k)
-    relevant_chunks = [text_chunks[i] for i in indices[0]]
-    context = "\n".join(relevant_chunks)
-    
-    genai.configure(api_key="AIzaSyBSGr1p4lbcwuf01K2Cb3mxAWewOf9I5z8")
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
-    response = gemini_model.generate_content(f"Based on the following information, answer the question: {query}\n\n{context}")
-    return response.text
+    except FileNotFoundError:
+        return JSONResponse(content={"error": "Model file not found for this session"})
