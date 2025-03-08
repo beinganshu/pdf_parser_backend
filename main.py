@@ -1,27 +1,28 @@
-import fitz
 import pytesseract
 from pdf2image import convert_from_path
 import re
+import pdfplumber
 from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 import google.generativeai as genai
-import shutil
-import os
+import pickle
 
 def extract_text_from_pdf(pdf_path, use_ocr=False, ocr_lang='eng'):
-    doc = fitz.open(pdf_path)
     extracted_text = []
     
-    for page in doc:
-        text = page.get_text("text")
-        if not text.strip() and use_ocr:
-            images = convert_from_path(pdf_path, first_page=page.number + 1, last_page=page.number + 1)
-            for img in images:
-                text = pytesseract.image_to_string(img, lang=ocr_lang)
-        extracted_text.append(text.strip())
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text and use_ocr:
+                try:
+                    images = convert_from_path(pdf_path, first_page=page.page_number, last_page=page.page_number, dpi=100)
+                    for img in images:
+                        text = pytesseract.image_to_string(img, lang=ocr_lang)
+                except Exception as e:
+                    print(f"Error processing page {page.page_number}: {e}")
+            extracted_text.append(text.strip() if text else '')
     
-    doc.close()
     return extracted_text
 
 def clean_and_chunk_text(text_list, chunk_size=500):
@@ -48,8 +49,6 @@ def query_gemini_ai(query, index, model, text_chunks, top_k=5):
     gemini_model = genai.GenerativeModel("gemini-1.5-flash")
     response = gemini_model.generate_content(f"Based on the following information, answer the question: {query}\n\n{context}")
     return response.text
-
-import pickle
 
 def save_model(file_path, index, model, text_chunks):
     """ Saves the FAISS index and text chunks. """
